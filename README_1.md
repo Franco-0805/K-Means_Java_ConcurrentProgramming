@@ -6,7 +6,7 @@ A Java implementation of the K-Means clustering algorithm accelerated with multi
 
 ## What is K-Means?
 
-K-Means is an unsupervised machine learning algorithm that partitions a dataset into **K distinct clusters**. The goal is to group data points so that points within the same cluster are as close to each other as possible, while points in different clusters are as far apart as possible.
+K-Means is an unsupervised machine learning algorithm that partitions a dataset into **K distinct clusters**. The goal is to group data points so that points within the same cluster are as close to each other as possible, while points in different clusters are as far apart as possible
 
 ### How It Works
 
