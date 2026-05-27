@@ -47,18 +47,47 @@ In this project the threshold is set to `0.001`, which means the algorithm stops
 ## Project Structure
 
 ```
-src/main/java/org/example/
-├── Main.java               # Entry point — runs K-Means and controls the main loop
-├── ClusterWorker.java      # Runnable task — assigns points to centroids in parallel
-├── ClusterVisualizer.java  # Swing panel — visualizes clustered results with coloring
-└── PointVisualizer.java    # Swing panel — visualizes raw (pre-clustering) data points
+src/main/java/
+├── org/example/
+│   ├── Main.java               # Entry point — runs the parallel K-Means and controls the main loop
+│   ├── ClusterWorker.java      # Runnable task — assigns points to centroids in parallel
+│   ├── ClusterVisualizer.java  # Swing panel — visualizes clustered results with coloring
+│   └── PointVisualizer.java    # Swing panel — visualizes raw (pre-clustering) data points
+└── Lock_Implemetation/
+    ├── Cluster_LockVersion.java # Two-phase ping-pong K-Means using ReentrantLock + Condition
+    └── Driver_LockVersion.java  # Entry point for the lock-based teaching version
 ```
+
+The project ships **two independent implementations** that demonstrate different aspects of concurrent programming:
+
+| Version | Goal | Concurrency Primitive |
+|---|---|---|
+| `org.example.Main` | **Performance** — real data parallelism | `Thread` + `join()` barrier (lock-free) |
+| `Lock_Implemetation` | **Coordination** — explicit synchronization showcase | `ReentrantLock` + `Condition` |
+
+The two versions are intentionally complementary: the first shows *where* parallelism is profitable in K-Means, the second shows *how* synchronization primitives coordinate phase-dependent threads.
 
 ---
 
-## Thread Safety: Lock-Free Design
+## Thread Safety: Lock-Free Design (Performance Version)
 
 The assignment step — checking which centroid is closest for each of the 1,000 data points — is the most computationally expensive part of the algorithm. This project parallelizes it across all available CPU cores.
+
+### Why `threadCount = availableProcessors()`
+
+In `Main.java` the worker thread count is set to the number of physical/logical CPU cores reported by the JVM:
+
+```java
+int cpuCores = Runtime.getRuntime().availableProcessors();
+int threadCount = cpuCores;
+```
+
+This is a deliberate design choice rather than an arbitrary number:
+
+1. **One worker per core saturates the CPU.** Since the assignment step is purely CPU-bound (no I/O, no blocking), a thread can keep a core busy 100% of the time. Spawning *exactly* one thread per core extracts the maximum possible parallel throughput.
+2. **Avoids context-switching overhead.** Creating more threads than cores forces the OS scheduler to time-slice them onto the same physical cores, which incurs context switches, cache invalidation, and TLB flushes. With `threadCount == cpuCores`, every thread can ideally run on its own core for the entire assignment phase, eliminating most of this overhead.
+3. **Avoids under-utilization.** Using fewer threads than cores would leave hardware idle and cap the achievable speedup below what the machine can deliver.
+4. **Portable across machines.** The value is queried at runtime, so the program automatically scales: a 4-core laptop runs 4 workers, a 16-core workstation runs 16, with no code change required.
 
 ### The Concurrency Strategy
 
@@ -127,6 +156,79 @@ The correctness of the approach rests on three properties:
 
 ---
 
+## Lock-Based Implementation (Teaching / Coordination Version)
+
+The `Lock_Implemetation` package contains an alternative version of K-Means built around `ReentrantLock` and `Condition`. **It is not intended to outperform the lock-free version** — in fact, it runs slightly slower than a single-threaded baseline. Its purpose is to demonstrate how explicit synchronization primitives can coordinate two threads that have a strict phase dependency.
+
+### Design: Two-Phase Ping-Pong
+
+Two dedicated threads cooperate on one shared `Cluster_LockVersion` instance:
+
+| Thread | Responsibility |
+|---|---|
+| `AssignPoints` | Runs the assignment step — labels every data point with its nearest centroid |
+| `updateCentroids` | Runs the update step — recomputes each centroid as the mean of its assigned points |
+
+Because K-Means imposes a strict ordering (`assign → update → assign → ...`), the two threads must execute *alternately*, never simultaneously. This is enforced by a single `ReentrantLock`, a single `Condition`, and an explicit phase variable:
+
+```java
+private enum Phase { ASSIGN, UPDATE }
+private Phase phase = Phase.UPDATE;   // initial phase decides who runs first
+```
+
+Each thread, on entering its method, checks whether it is currently its turn. If not, it calls `condition.await()` and releases the lock. When the other thread finishes its phase, it flips the `phase` variable and calls `signalAll()`, waking up its counterpart.
+
+```java
+// Inside UpdateCentroids(...)
+while (notConverged && phase != Phase.UPDATE) {
+    condition.await();         // release the lock and sleep until signalled
+}
+// ... do the update work ...
+phase = Phase.ASSIGN;          // hand control to the assign thread
+condition.signalAll();
+```
+
+The symmetric block lives in `assignCluster()`. Together they form a deterministic ping-pong: `update → assign → update → assign → ...`
+
+### Choosing Who Goes First
+
+The starting phase is controlled entirely by the initial value of the `phase` field. Setting it to `Phase.UPDATE` (the current default) makes the update thread run first; setting it to `Phase.ASSIGN` would reverse the order. **No `Thread.sleep()` and no thread-start ordering tricks are needed** — correctness comes from the synchronization logic itself, not from timing assumptions.
+
+### Why `while` and Not `if` Around `await()`
+
+The two waiting blocks use `while` rather than `if`:
+
+```java
+while (notConverged && phase != Phase.UPDATE) {
+    condition.await();
+}
+```
+
+This is the textbook-correct pattern for two reasons:
+
+1. **Spurious wakeups.** Java's `Condition.await()` is permitted to return without a corresponding `signal()` (a quirk of the underlying OS primitives). A `while` loop forces the thread to re-check the predicate after every wakeup, preventing it from proceeding when the condition is not actually satisfied.
+2. **`signalAll()` wakes both threads.** Since the two threads share one `Condition`, every `signalAll()` rouses both of them. The loop ensures that the wrong-turn thread immediately goes back to sleep, preserving strict alternation.
+
+### Why This Version Does Not Aim For Speedup
+
+The two threads can never run in parallel — the lock guarantees mutual exclusion, and the phase variable enforces ordering. At any instant, at most one thread is doing useful work; the other is blocked on `await()`. This is a deliberate property of the design: K-Means' two phases are inherently sequential at the *phase-pair* level (you cannot update centroids before assignments are finished, nor reassign before centroids are updated), so partitioning work *across phases* offers no speedup.
+
+Real parallelism for K-Means must come from partitioning *within* a phase — which is exactly what the lock-free `Main.java` version does. The lock-based version is therefore best understood as a **synchronization-primitive case study**: a clean, correct demonstration of how `ReentrantLock` + `Condition` + a phase variable solve the classical "strictly alternating threads" problem.
+
+### Running the Lock Version
+
+```bash
+# Compile
+javac -d out src/main/java/Lock_Implemetation/*.java
+
+# Run
+java -cp out Lock_Implemetation.Driver_LockVersion
+```
+
+The program prompts for the number of data points and the number of centroids, then runs until convergence and prints each iteration.
+
+---
+
 ## Running the Project
 
 **Prerequisites:** Java 11+, a JDK with Swing support.
@@ -148,7 +250,7 @@ The console will print centroid positions and total shift at each iteration. A S
 | `totalPoints` | `1000` | Number of random data points |
 | `k` | `3` | Number of clusters |
 | `convergeThreshold` | `0.001` | Minimum total centroid shift to continue |
-| `threadCount` | CPU core count | Number of parallel worker threads |
+| `threadCount` | `Runtime.getRuntime().availableProcessors()` | One worker per CPU core to maximize throughput and minimize context switches |
 
 ---
 
